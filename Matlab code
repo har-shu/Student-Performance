@@ -1,0 +1,285 @@
+% Read the data
+data = readtable('student-mat.csv');
+
+% Preprocessing steps: Handling missing values and normalizing features
+
+% Remove rows with missing values
+data = rmmissing(data);
+
+% Identify numeric columns
+numericVars = varfun(@isnumeric, data, 'OutputFormat', 'uniform');
+numericData = data(:, numericVars);
+
+% Normalize numeric data
+normalizedNumericData = normalize(table2array(numericData));
+
+% Convert normalized numeric data back to table
+normalizedData = array2table(normalizedNumericData, 'VariableNames', numericData.Properties.VariableNames);
+
+% Extract and encode non-numeric columns
+nonNumericData = data(:, ~numericVars);
+
+% Convert categorical variables to dummy variables (numeric format)
+if ~isempty(nonNumericData)
+    nonNumericData = varfun(@categorical, nonNumericData, 'OutputFormat', 'table');
+    nonNumericData = varfun(@dummyvar, nonNumericData, 'OutputFormat', 'table');
+    % Flatten the resulting dummy variable table into a single table
+    nonNumericData = [nonNumericData{:,:}];
+    nonNumericData = array2table(nonNumericData, 'VariableNames', strcat('Cat_', string(1:size(nonNumericData, 2))));
+end
+
+% Combine normalized numeric data with encoded categorical data
+finalData = [normalizedData, nonNumericData];
+
+% Ensure target variable is numeric and extracted correctly
+% Assume target variable is the last column and ensure it's numeric
+if iscell(finalData{:, end})
+    Y = cell2mat(finalData{:, end});
+else
+    Y = finalData{:, end};
+end
+
+% Extract features and target variable
+X = finalData{:, 1:end-1}; % Features: All columns except the last one
+Y = finalData{:, end};     % Target: The last column
+
+% Split the data into training and testing sets
+cv = cvpartition(size(X, 1), 'HoldOut', 0.3);
+XTrain = X(training(cv), :);
+YTrain = Y(training(cv), :);
+XTest = X(test(cv), :);
+YTest = Y(test(cv), :);
+
+% Train the SVM classifier
+svmModel = fitcsvm(XTrain, YTrain);
+YTestPredSVM = predict(svmModel, XTest);
+
+% Calculate accuracy
+accuracySVM = sum(YTestPredSVM == YTest) / length(YTest) * 100;
+fprintf('Accuracy of SVM classifier: %.2f%%\n', accuracySVM);
+
+% Check for predictors with zero variance within each class
+uniqueClasses = unique(YTrain);
+zeroVariancePredictors = [];
+
+for i = 1:size(XTrain, 2)
+    for j = 1:length(uniqueClasses)
+        classData = XTrain(YTrain == uniqueClasses(j), i);
+        if std(classData) == 0
+            zeroVariancePredictors = [zeroVariancePredictors, i];
+            break;
+        end
+    end
+end
+
+% Display predictors with zero variance
+disp('Predictors with zero within-class variance:');
+disp(zeroVariancePredictors);
+% Remove predictors with zero variance
+XTrainFiltered = XTrain(:, ~ismember(1:size(XTrain, 2), zeroVariancePredictors));
+XTestFiltered = XTest(:, ~ismember(1:size(XTest, 2), zeroVariancePredictors));
+
+% Train LDA model with filtered data
+ldaModel = fitcdiscr(XTrainFiltered, YTrain);
+
+% Make predictions
+YTestPredLDA = predict(ldaModel, XTestFiltered);
+
+% Calculate accuracy
+accuracyLDA = sum(YTestPredLDA == YTest) / length(YTest) * 100;
+fprintf('Accuracy of LDA classifier: %.2f%%\n', accuracyLDA);
+
+
+% Apply PCA to the training data
+[coeff, score, ~, ~, explained] = pca(XTrain);
+
+% Choose the number of components that explain 95% of the variance
+explainedVariance = cumsum(explained);
+numComponents = find(explainedVariance >= 95, 1);
+
+% Transform the training data using the selected components
+XTrainPCA = score(:, 1:numComponents);
+
+% Center the test data using the mean of the training data
+XTestCentered = XTest - mean(XTrain);
+
+% Transform the centered test data using the PCA coefficients
+XTestPCA = XTestCentered * coeff(:, 1:numComponents);
+
+% Train the SVM classifier on the reduced data
+svmModelPCA = fitcsvm(XTrainPCA, YTrain);
+
+% Make predictions on the test data
+YTestPredSVM_PCA = predict(svmModelPCA, XTestPCA);
+
+% Calculate accuracy
+accuracySVM_PCA = sum(YTestPredSVM_PCA == YTest) / length(YTest) * 100;
+fprintf('Accuracy of SVM classifier with PCA: %.2f%%\n', accuracySVM_PCA);
+
+
+% Define a function to evaluate the model's performance
+function mse = evaluateModel(XTrain, YTrain, XTest, YTest)
+    % Train SVM model
+    svmModel = fitcsvm(XTrain, YTrain);
+    % Predict on test data
+    YPred = predict(svmModel, XTest);
+    % Compute Mean Squared Error as performance metric
+    mse = mean((YPred - YTest).^2);
+end
+
+% Create a cvpartition object for sequentialfs
+cvPartition = cvpartition(size(XTrain, 1), 'KFold', 5);
+
+% Perform Sequential Feature Selection
+opts = statset('Display', 'iter');
+[fs, history] = sequentialfs(@(X, Y, XTest, YTest) evaluateModel(X, Y, XTest, YTest), XTrain, YTrain, 'cv', cvPartition, 'options', opts);
+
+% Get selected features
+selectedFeatures = fs; % Logical vector indicating which features are selected
+
+% Reduce training and testing data to selected features
+XTrainFiltered = XTrain(:, selectedFeatures);
+XTestFiltered = XTest(:, selectedFeatures);
+
+% Train SVM model with selected features
+svmModel = fitcsvm(XTrainFiltered, YTrain);
+YTestPredSVM = predict(svmModel, XTestFiltered);
+
+% Calculate accuracy
+accuracySVM = sum(YTestPredSVM == YTest) / length(YTest) * 100;
+fprintf('Accuracy of SVM classifier with selected features: %.2f%%\n', accuracySVM);
+
+
+
+% Define a function for Margin-Based Refinement
+function [bestFeatures, bestMSE] = marginBasedRefinement(XTrain, YTrain, XTest, YTest, initialFeatures)
+    % Initialize variables
+    bestMSE = inf;
+    bestFeatures = initialFeatures;
+    numFeatures = length(initialFeatures);
+    
+    % Evaluate performance for the initial feature set
+    XTrainSubset = XTrain(:, initialFeatures);
+    XTestSubset = XTest(:, initialFeatures);
+    bestMSE = evaluateModel(XTrainSubset, YTrain, XTestSubset, YTest);
+    
+    % Initialize margin-based importance
+    margins = zeros(1, numFeatures);
+    
+    % Train an SVM model with the initial features
+    svmModel = fitcsvm(XTrainSubset, YTrain, 'Standardize', true);
+    
+    % Get the decision values (margins) for training data
+    [~, score] = predict(svmModel, XTrainSubset);
+    
+    % Calculate margins for each feature
+    for i = 1:numFeatures
+        % Exclude the i-th feature
+        tempFeatures = setdiff(initialFeatures, i);
+        XTrainTemp = XTrain(:, tempFeatures);
+        XTestTemp = XTest(:, tempFeatures);
+        
+        % Train SVM model on the reduced feature set
+        svmModelTemp = fitcsvm(XTrainTemp, YTrain, 'Standardize', true);
+        
+        % Evaluate performance
+        mse = evaluateModel(XTrainTemp, YTrain, XTestTemp, YTest);
+        
+        % Compute margin importance (difference in MSE)
+        margins(i) = bestMSE - mse;
+        
+        % Update best features if the current set performs better
+        if mse < bestMSE
+            bestMSE = mse;
+            bestFeatures = tempFeatures;
+        end
+    end
+    
+    % Output margin values
+    fprintf('Feature margins:\n');
+    disp(margins);
+end
+
+% Define a function to evaluate the model's performance
+function mse = evaluaModel(XTrain, YTrain, XTest, YTest)
+    % Train SVM model
+    svmModel = fitcsvm(XTrain, YTrain, 'Standardize', true);
+    % Predict on test data
+    YPred = predict(svmModel, XTest);
+    % Compute Mean Squared Error as performance metric
+    mse = mean((YPred - YTest).^2);
+end
+
+% Example usage with dummy data (replace with actual data)
+% XTrain and XTest should be preprocessed and available from your previous steps
+% YTrain and YTest should be the target variables for training and testing
+
+% Define initial features (all features included initially)
+initialFeatures = 1:size(XTrain, 2);
+
+% Call margin-based refinement function
+[finalFeatures, finalMSE] = marginBasedRefinement(XTrain, YTrain, XTest, YTest, initialFeatures);
+
+% Output the final selected features and corresponding MSE
+fprintf('Final features selected: %s\n', mat2str(finalFeatures));
+fprintf('Final Mean Squared Error: %.4f\n', finalMSE);
+
+
+
+% Define a function for Combinatorial Refinement
+function [bestFeatures, bestMSE] = combinatorialRefinement(XTrain, YTrain, XTest, YTest, initialFeatures)
+   % Initialize variables
+   bestMSE = inf;
+   bestFeatures = initialFeatures;
+   % Define the maximum number of features to consider for combinations
+   numFeatures = length(initialFeatures);
+   maxNumFeatures = min(10, numFeatures); % Adjust based on your needs
+   % Iterate over subsets of feature sizes
+   for k = 1:maxNumFeatures
+       % Generate combinations of the given size
+       featureComb = nchoosek(1:numFeatures, k);
+       % Iterate over each combination
+       for i = 1:size(featureComb, 1)
+           subset = featureComb(i, :);
+           XTrainSubset = XTrain(:, subset);
+           XTestSubset = XTest(:, subset);
+          
+           % Evaluate the model with the current subset of features
+           mse = evaluateModel(XTrainSubset, YTrain, XTestSubset, YTest);
+          
+           % Update best features if current subset has better performance
+           if mse < bestMSE
+               bestMSE = mse;
+               bestFeatures = subset;
+           end
+       end
+      
+       % Debug output to monitor progress
+       fprintf('Completed combinations of size %d\n', k);
+   end
+end
+% Define a function to evaluate the model's performance
+function mse = evaluatModel(XTrain, YTrain, XTest, YTest)
+   % Train SVM model
+   svmModel = fitcsvm(XTrain, YTrain);
+   % Predict on test data
+   YPred = predict(svmModel, XTest);
+   % Compute Mean Squared Error as performance metric
+   mse = mean((YPred - YTest).^2);
+end
+% Example usage with dummy data (replace with actual data)
+% XTrain and XTest should be preprocessed and available from your previous steps
+% YTrain and YTest should be the target variables for training and testing
+% Define initial features (all features included initially)
+initialFeatures = 1:size(XTrain, 2);
+% Call combinatorial refinement function
+[finalFeatures, finalMSE] = combinatorialRefinement(XTrain, YTrain, XTest, YTest, initialFeatures);
+% Output the final selected features and corresponding MSE
+fprintf('Final features selected: %s\n', mat2str(finalFeatures));
+fprintf('Final Mean Squared Error: %.4f\n', finalMSE);
+%%
+% 
+%   for x = 1:10
+%       disp(x)
+%   end
+% 
